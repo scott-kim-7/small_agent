@@ -199,26 +199,6 @@ def test_call_llm_buffered(monkeypatch):
     assert out.content == "done"
 
 
-def test_call_llm_writes_debug_log(tmp_path, monkeypatch):
-    class FakeLLM:
-        def invoke(self, messages):
-            return AIMessage(content="logged")
-
-        def stream(self, messages):
-            raise AssertionError("stream should not be called")
-
-    monkeypatch.setenv("SMALL_AGENT_LLM_LOG", "1")
-    monkeypatch.setenv("SMALL_AGENT_LLM_LOG_DIR", str(tmp_path))
-    import llm_debug_log
-
-    llm_debug_log.session_log_path(reset=True)
-    _patch_fake_llm(monkeypatch, FakeLLM())
-    graph.call_llm([HumanMessage(content="debug me")], sink=None, forced=False)
-    files = list(tmp_path.glob("*.jsonl"))
-    assert len(files) == 1
-    assert "debug me" in files[0].read_text(encoding="utf-8")
-
-
 def test_call_llm_emits_tool_call_notice(monkeypatch):
     notices: list[str] = []
 

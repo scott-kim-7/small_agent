@@ -12,7 +12,7 @@ small_agent/
 ├── exa_search.py        # Exa web_search
 ├── context7_search.py   # Context7 library docs search
 ├── forced_choice.py     # tool_choice=required + respond_directly
-├── llm_debug_log.py     # optional LLM request/response JSONL logging
+├── llm_debug_log.py     # optional raw LLM HTTP request/response JSONL logging
 ├── graph.py             # LangGraph agent ↔ tools 루프 + CLI
 └── tests/
 ```
@@ -65,7 +65,7 @@ User → agent (LLM) → [tool_calls?] → tools (bash/python/web_search/context
 | `CONTEXT7_API_KEY` | (선택) Context7 API 키. 없으면 ada vault `context7.api_key` 시도 |
 | `SMALL_AGENT_STREAM` | `1` (0/false = `--no-stream`) |
 | `SMALL_AGENT_MAX_TOKENS` | `2048` |
-| `SMALL_AGENT_LLM_LOG` | (선택) `1`이면 LLM 요청/응답 JSONL 로깅 ON |
+| `SMALL_AGENT_LLM_LOG` | (선택) `1`이면 LLM HTTP 요청/응답 본문 JSONL 로깅 ON (`tools`, `tool_choice`, SSE 포함) |
 | `SMALL_AGENT_LLM_LOG_DIR` | (선택) 로그 디렉터리 (기본 `small_agent/.local/llm/`) |
 | `SMALL_AGENT_FORCE_CHOICE` | `1` (기본). `0`이면 `tool_choice=auto`, `respond_directly` 미사용 |
 

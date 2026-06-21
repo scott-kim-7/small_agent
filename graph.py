@@ -34,7 +34,7 @@ from forced_choice import (
     tool_choice_for_turn,
     tools_for_turn,
 )
-from llm_debug_log import llm_log_enabled, log_llm_exchange, session_log_path
+from llm_debug_log import llm_log_enabled, logging_http_client, session_log_path
 from python_executor import PythonExecutor
 
 _BASH = BashSession(work_dir=os.getcwd())
@@ -150,14 +150,17 @@ def build_llm_base() -> ChatOpenAI:
     api_key = llm_api_key()
     model = effective_model_id(base_url, api_key)
     max_tokens = int(os.environ.get("SMALL_AGENT_MAX_TOKENS", "2048"))
-    return ChatOpenAI(
-        base_url=base_url,
-        api_key=api_key,
-        model=model,
-        temperature=0.2,
-        timeout=300,
-        max_tokens=max_tokens,
-    )
+    kwargs: dict[str, Any] = {
+        "base_url": base_url,
+        "api_key": api_key,
+        "model": model,
+        "temperature": 0.2,
+        "timeout": 300,
+        "max_tokens": max_tokens,
+    }
+    if llm_log_enabled():
+        kwargs["http_client"] = logging_http_client()
+    return ChatOpenAI(**kwargs)
 
 
 def _forced_for_turn(messages: list[AnyMessage], forced: bool | None) -> bool:
@@ -332,13 +335,11 @@ def call_llm(
     use_stream = not (
         on_token is None and (sink is None or sink.on_tool_call is None)
     )
-    mode = "stream" if use_stream else "buffered"
 
     if not use_stream:
         response = llm.invoke(mlx_messages)
         result = response if isinstance(response, AIMessage) else AIMessage(content=str(response))
         _emit_tool_call_notices(list(result.tool_calls or []), sink)
-        log_llm_exchange(mlx_messages, result, mode=mode)
         return result
 
     announced: set[str] = set()
@@ -370,7 +371,6 @@ def call_llm(
         content = merged.content if isinstance(merged.content, str) else str(merged.content or "")
         result = AIMessage(content=content, tool_calls=tool_calls)
     _emit_tool_call_notices(list(result.tool_calls or []), sink, announced=announced)
-    log_llm_exchange(mlx_messages, result, mode=mode)
     return result
 
 
