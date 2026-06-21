@@ -34,7 +34,15 @@ from forced_choice import (
     tool_choice_for_turn,
     tools_for_turn,
 )
-from llm_debug_log import llm_log_enabled, logging_http_client, session_log_path
+from llm_debug_log import (
+    clear_stream_tap,
+    instrumented_http_client,
+    llm_log_enabled,
+    reasoning_piece_from_completion_payload,
+    reasoning_piece_from_sse_payload,
+    session_log_path,
+    set_stream_tap,
+)
 from python_executor import PythonExecutor
 
 _BASH = BashSession(work_dir=os.getcwd())
@@ -158,9 +166,14 @@ def build_llm_base() -> ChatOpenAI:
         "timeout": 300,
         "max_tokens": max_tokens,
     }
-    if llm_log_enabled():
-        kwargs["http_client"] = logging_http_client()
+    if llm_log_enabled() or show_thinking_enabled():
+        kwargs["http_client"] = instrumented_http_client()
     return ChatOpenAI(**kwargs)
+
+
+def show_thinking_enabled() -> bool:
+    raw = os.environ.get("SMALL_AGENT_SHOW_THINKING", "1").strip().lower()
+    return raw not in ("0", "false", "no", "off")
 
 
 def _forced_for_turn(messages: list[AnyMessage], forced: bool | None) -> bool:
@@ -271,6 +284,65 @@ class StreamSink:
 
     on_token: Callable[[str], None] | None = None
     on_tool_call: Callable[[str], None] | None = None
+    on_reasoning: Callable[[str], None] | None = None
+    close_thinking: Callable[[], None] | None = None
+
+
+def make_thinking_marker_handlers(
+    *,
+    write: Callable[[str], None] | None = None,
+) -> tuple[Callable[[str], None], Callable[[str], None], Callable[[str], None], Callable[[], None]]:
+    """Return on_reasoning, on_token, on_tool_call, close_thinking with [thinking] markers."""
+
+    def emit(piece: str) -> None:
+        if write is not None:
+            write(piece)
+        else:
+            print(piece, end="", flush=True)
+
+    thinking_open = False
+
+    def close_thinking() -> None:
+        nonlocal thinking_open
+        if thinking_open:
+            emit("\n[/thinking]\n")
+            thinking_open = False
+
+    def on_reasoning(piece: str) -> None:
+        nonlocal thinking_open
+        if not thinking_open:
+            emit("\n[thinking]\n")
+            thinking_open = True
+        emit(piece)
+
+    def on_token(piece: str) -> None:
+        close_thinking()
+        emit(piece)
+
+    def on_tool_call(line: str) -> None:
+        close_thinking()
+        emit(line)
+
+    return on_reasoning, on_token, on_tool_call, close_thinking
+
+
+def _thinking_tap_for_sink(sink: StreamSink) -> Callable[[dict[str, Any]], None]:
+    def tap(payload: dict[str, Any]) -> None:
+        if sink.on_reasoning is None:
+            return
+        piece = reasoning_piece_from_sse_payload(payload)
+        if piece is None:
+            piece = reasoning_piece_from_completion_payload(payload)
+        if piece:
+            sink.on_reasoning(piece)
+
+    return tap
+
+
+def _register_thinking_tap(sink: StreamSink | None) -> None:
+    if sink is None or sink.on_reasoning is None or not show_thinking_enabled():
+        return
+    set_stream_tap(_thinking_tap_for_sink(sink))
 
 
 def format_tool_call_notice(name: str, args: dict[str, Any]) -> str:
@@ -304,6 +376,8 @@ def _emit_tool_call_notices(
 ) -> None:
     if sink is None or sink.on_tool_call is None or not tool_calls:
         return
+    if sink.close_thinking is not None:
+        sink.close_thinking()
     seen = announced if announced is not None else set()
     for call in tool_calls:
         if not isinstance(call, dict):
@@ -336,42 +410,48 @@ def call_llm(
         on_token is None and (sink is None or sink.on_tool_call is None)
     )
 
-    if not use_stream:
-        response = llm.invoke(mlx_messages)
-        result = response if isinstance(response, AIMessage) else AIMessage(content=str(response))
-        _emit_tool_call_notices(list(result.tool_calls or []), sink)
-        return result
+    _register_thinking_tap(sink)
+    try:
+        if not use_stream:
+            response = llm.invoke(mlx_messages)
+            result = response if isinstance(response, AIMessage) else AIMessage(content=str(response))
+            _emit_tool_call_notices(list(result.tool_calls or []), sink)
+            return result
 
-    announced: set[str] = set()
-    merged = None
-    for chunk in llm.stream(mlx_messages):
-        piece = chunk_to_text(chunk)
-        if piece and on_token:
-            on_token(piece)
-        for tcc in _tool_call_chunks(chunk):
-            if not isinstance(tcc, dict):
-                continue
-            name = tcc.get("name")
-            if not name:
-                continue
-            idx = str(tcc.get("index", 0))
-            key = f"chunk:{idx}:{name}"
-            if key in announced:
-                continue
-            announced.add(key)
-            if sink and sink.on_tool_call:
-                sink.on_tool_call(f"\n[{name}] …\n")
-        merged = chunk if merged is None else merged + chunk
-    if merged is None:
-        result = AIMessage(content="")
-    elif isinstance(merged, AIMessage):
-        result = merged
-    else:
-        tool_calls = list(merged.tool_calls) if getattr(merged, "tool_calls", None) else []
-        content = merged.content if isinstance(merged.content, str) else str(merged.content or "")
-        result = AIMessage(content=content, tool_calls=tool_calls)
-    _emit_tool_call_notices(list(result.tool_calls or []), sink, announced=announced)
-    return result
+        announced: set[str] = set()
+        merged = None
+        for chunk in llm.stream(mlx_messages):
+            piece = chunk_to_text(chunk)
+            if piece and on_token:
+                on_token(piece)
+            for tcc in _tool_call_chunks(chunk):
+                if not isinstance(tcc, dict):
+                    continue
+                name = tcc.get("name")
+                if not name:
+                    continue
+                idx = str(tcc.get("index", 0))
+                key = f"chunk:{idx}:{name}"
+                if key in announced:
+                    continue
+                announced.add(key)
+                if sink and sink.close_thinking is not None:
+                    sink.close_thinking()
+                if sink and sink.on_tool_call:
+                    sink.on_tool_call(f"\n[{name}] …\n")
+            merged = chunk if merged is None else merged + chunk
+        if merged is None:
+            result = AIMessage(content="")
+        elif isinstance(merged, AIMessage):
+            result = merged
+        else:
+            tool_calls = list(merged.tool_calls) if getattr(merged, "tool_calls", None) else []
+            content = merged.content if isinstance(merged.content, str) else str(merged.content or "")
+            result = AIMessage(content=content, tool_calls=tool_calls)
+        _emit_tool_call_notices(list(result.tool_calls or []), sink, announced=announced)
+        return result
+    finally:
+        clear_stream_tap()
 
 
 def make_agent_node(sink: StreamSink | None = None):
@@ -492,24 +572,48 @@ def main(argv: list[str] | None = None) -> int:
         else "forced_choice OFF (SMALL_AGENT_FORCE_CHOICE=0)"
     )
     mode = "stream" if use_stream else "buffered"
+    thinking_note = "thinking ON" if show_thinking_enabled() else "thinking OFF"
 
     streamed_any = False
+
+    def _write(piece: str) -> None:
+        print(piece, end="", flush=True)
+
+    if show_thinking_enabled():
+        on_reasoning, on_token_base, on_tool_call_base, close_thinking = make_thinking_marker_handlers(
+            write=_write,
+        )
+    else:
+        close_thinking = lambda: None
+        on_reasoning = None
+
+        def on_token_base(piece: str) -> None:
+            _write(piece)
+
+        def on_tool_call_base(line: str) -> None:
+            _write(line)
 
     def on_token(piece: str) -> None:
         nonlocal streamed_any
         streamed_any = True
-        print(piece, end="", flush=True)
+        on_token_base(piece)
 
     def on_tool_call(line: str) -> None:
         nonlocal streamed_any
         streamed_any = True
-        print(line, end="", flush=True)
+        on_tool_call_base(line)
 
-    sink = (
-        StreamSink(on_token=on_token, on_tool_call=on_tool_call)
-        if use_stream
-        else None
-    )
+    if use_stream:
+        sink = StreamSink(
+            on_token=on_token,
+            on_tool_call=on_tool_call,
+            on_reasoning=on_reasoning,
+            close_thinking=close_thinking,
+        )
+    elif show_thinking_enabled():
+        sink = StreamSink(on_reasoning=on_reasoning, close_thinking=close_thinking)
+    else:
+        sink = None
     graph = build_graph(sink=sink)
     log_note = ""
     if llm_log_enabled():
@@ -517,7 +621,7 @@ def main(argv: list[str] | None = None) -> int:
         if log_path is not None:
             log_note = f", llm log → {log_path}"
     print(
-        f"agent ready (model={model_id}, {mode}, {fc_note}, {search_note}, {c7_note}{log_note}, /quit to exit)"
+        f"agent ready (model={model_id}, {mode}, {thinking_note}, {fc_note}, {search_note}, {c7_note}{log_note}, /quit to exit)"
     )
     history: list[AnyMessage] = refresh_system_message([])
     try:

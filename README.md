@@ -69,9 +69,10 @@ User → agent (LLM) → [tool_calls?] → tools (bash/python/web_search/context
 | `SMALL_AGENT_MAX_TOKENS` | `2048` |
 | `SMALL_AGENT_LLM_LOG` | (선택) `1`이면 LLM HTTP 요청/응답 본문 JSONL 로깅 ON (`tools`, `tool_choice`, SSE 포함) |
 | `SMALL_AGENT_LLM_LOG_DIR` | (선택) 로그 디렉터리 (기본 `small_agent/.local/llm/`) |
+| `SMALL_AGENT_SHOW_THINKING` | `1` (0/false = thinking 미표시). Ollama `reasoning_content`를 `[thinking]…[/thinking]`으로 스트리밍 |
 | `SMALL_AGENT_FORCE_CHOICE` | `1` (기본). `0`이면 `tool_choice=auto`, `respond_directly` 미사용 |
 
-시작 시 `forced_choice ON|OFF` / `stream` / 검색 도구 상태가 표시됩니다. LLM 로깅 ON이면 `llm log → …jsonl` 경로도 출력됩니다.
+시작 시 `thinking ON|OFF` / `forced_choice ON|OFF` / `stream` / 검색 도구 상태가 표시됩니다. LLM 로깅 ON이면 `llm log → …jsonl` 경로도 출력됩니다.
 
 첫 LLM 호출은 `tool_choice=required`로 도구를 하나 고르게 합니다. `respond_directly`만 선택되면 tools 루프 없이 바로 텍스트 답변합니다.
 

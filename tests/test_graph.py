@@ -173,6 +173,47 @@ def test_chunk_to_text():
     assert graph.chunk_to_text(AIMessage(content="")) == ""
 
 
+def test_show_thinking_enabled_default(monkeypatch):
+    monkeypatch.delenv("SMALL_AGENT_SHOW_THINKING", raising=False)
+    assert graph.show_thinking_enabled() is True
+
+
+def test_show_thinking_disabled(monkeypatch):
+    monkeypatch.setenv("SMALL_AGENT_SHOW_THINKING", "0")
+    assert graph.show_thinking_enabled() is False
+
+
+def test_make_thinking_marker_handlers():
+    parts: list[str] = []
+    on_reasoning, on_token, on_tool_call, _close = graph.make_thinking_marker_handlers(
+        write=parts.append,
+    )
+    on_reasoning("plan")
+    on_token("answer")
+    on_tool_call("\n[bash] ls\n")
+    text = "".join(parts)
+    assert "[thinking]" in text
+    assert "[/thinking]" in text
+    assert "plan" in text
+    assert "answer" in text
+    assert "[bash]" in text
+
+
+def test_thinking_tap_for_sink():
+    reasoning: list[str] = []
+    sink = graph.StreamSink(on_reasoning=reasoning.append)
+    tap = graph._thinking_tap_for_sink(sink)
+    tap({"choices": [{"delta": {"reasoning_content": "step"}}]})
+    tap(
+        {
+            "choices": [
+                {"message": {"reasoning_content": "full plan", "content": "hi"}},
+            ]
+        }
+    )
+    assert reasoning == ["step", "full plan"]
+
+
 def test_format_tool_call_notice():
     assert "ls" in graph.format_tool_call_notice("bash", {"command": "ls"})
     assert "news" in graph.format_tool_call_notice("web_search", {"query": "news"})

@@ -1,4 +1,4 @@
-"""Optional JSONL logging of raw HTTP payloads to/from the LLM server."""
+"""Optional JSONL logging and live SSE tap for raw HTTP LLM exchanges."""
 
 from __future__ import annotations
 
@@ -12,17 +12,22 @@ import httpx
 
 _CALL_INDEX = 0
 _SESSION_LOG_PATH: Path | None = None
-_LOGGING_HTTP_CLIENT: httpx.Client | None = None
+_INSTRUMENTED_HTTP_CLIENT: httpx.Client | None = None
+_STREAM_TAP: Callable[[dict[str, Any]], None] | None = None
+
+REASONING_DELTA_KEYS = ("reasoning_content", "thinking", "reasoning")
+StreamTap = Callable[[dict[str, Any]], None]
 
 
 def reset_llm_log_state() -> None:
-    """Reset session file, call counter, and HTTP client (for tests)."""
-    global _CALL_INDEX, _SESSION_LOG_PATH, _LOGGING_HTTP_CLIENT
+    """Reset session file, call counter, HTTP client, and stream tap (for tests)."""
+    global _CALL_INDEX, _SESSION_LOG_PATH, _INSTRUMENTED_HTTP_CLIENT, _STREAM_TAP
     _CALL_INDEX = 0
     _SESSION_LOG_PATH = None
-    if _LOGGING_HTTP_CLIENT is not None:
-        _LOGGING_HTTP_CLIENT.close()
-        _LOGGING_HTTP_CLIENT = None
+    _STREAM_TAP = None
+    if _INSTRUMENTED_HTTP_CLIENT is not None:
+        _INSTRUMENTED_HTTP_CLIENT.close()
+        _INSTRUMENTED_HTTP_CLIENT = None
 
 
 def llm_log_enabled() -> bool:
@@ -51,6 +56,53 @@ def session_log_path(*, reset: bool = False) -> Path | None:
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     _SESSION_LOG_PATH = log_dir / f"{stamp}-{os.getpid()}.jsonl"
     return _SESSION_LOG_PATH
+
+
+def set_stream_tap(tap: StreamTap | None) -> None:
+    """Register a per-call callback for each parsed chat/completions SSE JSON object."""
+    global _STREAM_TAP
+    _STREAM_TAP = tap
+
+
+def clear_stream_tap() -> None:
+    set_stream_tap(None)
+
+
+def reasoning_piece_from_message_dict(message: dict[str, Any]) -> str | None:
+    for key in REASONING_DELTA_KEYS:
+        value = message.get(key)
+        if value is not None and value != "":
+            return str(value)
+    return None
+
+
+def reasoning_piece_from_sse_payload(data: dict[str, Any]) -> str | None:
+    for choice in data.get("choices") or []:
+        if not isinstance(choice, dict):
+            continue
+        delta = choice.get("delta")
+        if isinstance(delta, dict):
+            piece = reasoning_piece_from_message_dict(delta)
+            if piece:
+                return piece
+    return None
+
+
+def reasoning_piece_from_completion_payload(data: dict[str, Any]) -> str | None:
+    for choice in data.get("choices") or []:
+        if not isinstance(choice, dict):
+            continue
+        message = choice.get("message")
+        if isinstance(message, dict):
+            piece = reasoning_piece_from_message_dict(message)
+            if piece:
+                return piece
+    return None
+
+
+def emit_sse_payload(data: dict[str, Any]) -> None:
+    if _STREAM_TAP is not None:
+        _STREAM_TAP(data)
 
 
 def _next_call_index() -> int:
@@ -125,7 +177,24 @@ def append_log_record(record: dict[str, Any]) -> Path | None:
     return path
 
 
-class _TeeByteStream(httpx.SyncByteStream):
+def _process_sse_line(line: str) -> None:
+    stripped = line.strip()
+    if not stripped.startswith("data:"):
+        return
+    payload = stripped[5:].strip()
+    if not payload or payload == "[DONE]":
+        return
+    try:
+        data = json.loads(payload)
+    except json.JSONDecodeError:
+        return
+    if isinstance(data, dict):
+        emit_sse_payload(data)
+
+
+class _TapTeeByteStream(httpx.SyncByteStream):
+    """Pass-through stream that taps each SSE JSON line and logs the full body."""
+
     def __init__(
         self,
         inner: httpx.SyncByteStream,
@@ -135,12 +204,17 @@ class _TeeByteStream(httpx.SyncByteStream):
         self._inner = inner
         self._on_complete = on_complete
         self._chunks: list[bytes] = []
+        self._line_buf = ""
         self._finished = False
 
     def __iter__(self):
         try:
             for chunk in self._inner:
                 self._chunks.append(chunk)
+                self._line_buf += chunk.decode("utf-8", errors="replace")
+                while "\n" in self._line_buf:
+                    line, self._line_buf = self._line_buf.split("\n", 1)
+                    _process_sse_line(line)
                 yield chunk
         finally:
             self._finish()
@@ -153,11 +227,13 @@ class _TeeByteStream(httpx.SyncByteStream):
         if self._finished:
             return
         self._finished = True
+        if self._line_buf.strip():
+            _process_sse_line(self._line_buf)
         self._on_complete(b"".join(self._chunks))
 
 
 class LoggingTransport(httpx.BaseTransport):
-    """Log full OpenAI-compatible HTTP request/response bodies."""
+    """Log full OpenAI-compatible HTTP request/response bodies and tap SSE chunks."""
 
     def __init__(self, wrapped: httpx.BaseTransport | None = None) -> None:
         self._wrapped = wrapped or httpx.HTTPTransport()
@@ -171,6 +247,9 @@ class LoggingTransport(httpx.BaseTransport):
             return self._wrap_streaming_response(response, call_index, req_snapshot, request)
 
         body = response.read()
+        parsed = _try_parse_json(body)
+        if isinstance(parsed, dict):
+            emit_sse_payload(parsed)
         append_log_record(
             {
                 "ts": datetime.now(timezone.utc).astimezone().isoformat(),
@@ -208,7 +287,7 @@ class LoggingTransport(httpx.BaseTransport):
         return httpx.Response(
             status_code=response.status_code,
             headers=response.headers,
-            stream=_TeeByteStream(response.stream, on_complete=on_complete),
+            stream=_TapTeeByteStream(response.stream, on_complete=on_complete),
             request=request,
         )
 
@@ -216,12 +295,17 @@ class LoggingTransport(httpx.BaseTransport):
         self._wrapped.close()
 
 
-def logging_http_client() -> httpx.Client:
-    """Shared httpx client that JSONL-logs every chat/completions HTTP exchange."""
-    global _LOGGING_HTTP_CLIENT
-    if _LOGGING_HTTP_CLIENT is None:
-        _LOGGING_HTTP_CLIENT = httpx.Client(
+def instrumented_http_client() -> httpx.Client:
+    """Shared httpx client with JSONL logging and optional live SSE tap."""
+    global _INSTRUMENTED_HTTP_CLIENT
+    if _INSTRUMENTED_HTTP_CLIENT is None:
+        _INSTRUMENTED_HTTP_CLIENT = httpx.Client(
             transport=LoggingTransport(),
             timeout=300.0,
         )
-    return _LOGGING_HTTP_CLIENT
+    return _INSTRUMENTED_HTTP_CLIENT
+
+
+def logging_http_client() -> httpx.Client:
+    """Backward-compatible alias for instrumented_http_client()."""
+    return instrumented_http_client()

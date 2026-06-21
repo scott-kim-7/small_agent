@@ -111,3 +111,70 @@ def test_append_log_record_noop_when_disabled(monkeypatch, tmp_path):
     path = llm_debug_log.append_log_record({"event": "llm_http"})
     assert path is None
     assert list(tmp_path.iterdir()) == []
+
+
+def test_reasoning_piece_from_sse_payload():
+    payload = {
+        "choices": [{"delta": {"reasoning_content": "User", "content": ""}}],
+    }
+    assert llm_debug_log.reasoning_piece_from_sse_payload(payload) == "User"
+    assert llm_debug_log.reasoning_piece_from_completion_payload(payload) is None
+
+
+def test_reasoning_piece_from_completion_payload():
+    payload = {
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "reasoning_content": "plan here",
+                    "content": "hello",
+                }
+            }
+        ],
+    }
+    assert llm_debug_log.reasoning_piece_from_completion_payload(payload) == "plan here"
+
+
+def test_stream_tap_receives_reasoning_sse_chunks():
+    llm_debug_log.reset_llm_log_state()
+    tapped: list[str] = []
+
+    def tap(payload: dict) -> None:
+        piece = llm_debug_log.reasoning_piece_from_sse_payload(payload)
+        if piece:
+            tapped.append(piece)
+
+    llm_debug_log.set_stream_tap(tap)
+    sse = (
+        'data: {"choices":[{"delta":{"reasoning_content":"A","content":""}}]}\n\n'
+        'data: {"choices":[{"delta":{"reasoning_content":"B","content":""}}]}\n\n'
+        'data: {"choices":[{"delta":{"content":"hi"}}]}\n\n'
+        "data: [DONE]\n\n"
+    )
+
+    class ByteStream(httpx.SyncByteStream):
+        def __iter__(self):
+            yield sse.encode("utf-8")
+
+        def close(self) -> None:
+            return None
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            stream=ByteStream(),
+        )
+
+    transport = llm_debug_log.LoggingTransport(httpx.MockTransport(handler))
+    with httpx.Client(transport=transport) as client:
+        with client.stream(
+            "POST",
+            "http://127.0.0.1:8089/v1/chat/completions",
+            json={"model": "m", "messages": [], "stream": True},
+        ) as response:
+            response.read()
+
+    assert tapped == ["A", "B"]
+    llm_debug_log.clear_stream_tap()
