@@ -1,5 +1,7 @@
 # small_agent — LangGraph 코딩 에이전트
 
+![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
+
 OpenHands 스타일 **Observation**을 갖춘 bash/python ReAct 에이전트.
 
 ## 구조
@@ -84,3 +86,7 @@ pytest -q
 ## 주의
 
 도구는 **로컬에서 직접** 실행됩니다. 신뢰할 수 없는 입력에는 샌드박스/컨테이너 격리가 필요합니다.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
